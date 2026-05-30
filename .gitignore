@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+
+# Node
+node_modules/
+
+# Build artifacts
+out/
+plotter/dist/
+
+# Generated data (runtime)
+plotter/graph_data.json
+plotter/public/graph_data.json
+plotter/public/graph_data_*.json
+plotter/public/.graph_counter
+audit_results*.json
+agentic_log_*.txt
+tmp.txt
+
+# Dev server state
+.backend.log
+.backend.pid
+.plotter.log
+.plotter.pid
+
+# Deployment config (user-specific)
+.deploy.env
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Tool caches
+.aider.tags.cache.v4
+.ctxpilot/
+.ctxpilot
+.ignore
+
+# Auto-generated
+.github/copilot-instructions.md

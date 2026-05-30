@@ -1,0 +1,16 @@
+services:
+  repo-map:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: python:3.11-slim
+    image: repo-map:latest
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONHASHSEED: "0"
+    env_file:
+      - .env
+    volumes:
+      - /:/host:ro
+      - ./plotter/public:/app/plotter/public
