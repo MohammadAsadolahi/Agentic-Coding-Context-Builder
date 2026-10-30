@@ -1,320 +1,171 @@
 # Agentic Coding Context Builder
 
-**Task-aware repository analysis and context assembly for AI coding agents.**
+**Give coding agents the code that matters—not the entire repository.**
 
-Agentic Coding Context Builder constructs a focused, inspectable context payload for a developer's task. It combines [Aider's](https://aider.chat/docs/repomap.html) tree-sitter symbol extraction and weighted PageRank with prompt relevance, Git history, optional architecture documents, and an LLM-guided second pass. Instead of supplying an entire repository to a coding assistant, it selects and explains the pieces most likely to matter.
+A task-aware context engine that combines **tree-sitter**, **personalized PageRank**, **Git history**, and **LLM-guided file selection** to prepare focused repository context before an AI coding assistant starts working.
 
-**Scope:** This is a context builder, not an autonomous code editor. It does not modify the source of the target repository. Agentic mode uses OpenRouter for file-selection reasoning; deterministic mode does not require an LLM call.
+**Explore the codebase intelligently. Rank what matters. Deliver actionable context.**
 
-## How it works
+[Quick start](#quick-start) · [How it works](#how-it-works) · [API](#api-and-interfaces) · [Algorithm internals](docs/ALGORITHM.md)
 
-```mermaid
-flowchart TB
-    %% 01 — Deterministic discovery and structural ranking
-    TASK(["Developer task<br/>Natural-language coding request"]):::entry
+---
 
-    subgraph DISCOVERY["01 / DISCOVER & RANK"]
-        direction LR
-        FILES["Repository signals<br/>Git · task terms · history"]:::analysis
-        TAGS["Symbol extraction<br/>tree-sitter definitions + references"]:::analysis
-        GRAPH[("Weighted reference graph<br/>directed file-level links")]:::graph
-        RANK["Personalized PageRank<br/>α = 0.85"]:::graph
-        MAP1[["PASS 1<br/>Broad repository map"]]:::pass
-        FILES --> TAGS --> GRAPH --> RANK --> MAP1
-    end
+## Why this exists
 
-    %% 02 — Optional architecture triage + LLM-guided exploration
-    subgraph EXPLORATION["02 / UNDERSTAND THE TASK"]
-        direction LR
-        TRIAGE["Feature triage<br/>architecture + flow documents"]:::optional
-        AGENT["LLM graph exploration<br/>boost · downgrade · context notes"]:::agent
-        CHECK["Pydantic validation<br/>safe, existing file paths"]:::validation
-        TRIAGE --> AGENT --> CHECK
-    end
+A coding agent needs relevant interfaces, implementation paths, and tests—not thousands of unrelated lines. This project builds a ranked, task-specific repository map, then lets an LLM refine that ranking and attach the most useful source files.
 
-    %% 03 — Refocus the structural map and assemble downstream context
-    subgraph REFINEMENT["03 / BUILD FOCUSED CONTEXT"]
-        direction LR
-        MAP2[["PASS 2<br/>Seed + rerank with PageRank"]]:::pass
-        PACK["Context assembly<br/>navigation notes + source excerpts"]:::analysis
-        MAP2 --> PACK
-    end
-
-    OUT(["Task-ready context<br/>For the downstream coding agent"]):::result
-    VIEW["React Flow visualization<br/>graph + diagnostic history"]:::optional
-
-    TASK --> FILES
-    TASK -. optional .-> TRIAGE
-    MAP1 --> AGENT
-    CHECK --> MAP2
-    PACK --> OUT
-    MAP1 -. single-pass mode .-> OUT
-    MAP1 -.-> VIEW
-    MAP2 -.-> VIEW
-
-    %% High-contrast palette suitable for GitHub light and dark themes
-    classDef entry fill:#0F172A,stroke:#38BDF8,color:#F8FAFC,stroke-width:2px
-    classDef analysis fill:#EFF6FF,stroke:#60A5FA,color:#1E3A8A,stroke-width:1.5px
-    classDef graph fill:#DBEAFE,stroke:#2563EB,color:#1E40AF,stroke-width:2px
-    classDef pass fill:#1D4ED8,stroke:#93C5FD,color:#FFFFFF,stroke-width:2px
-    classDef agent fill:#F3E8FF,stroke:#A855F7,color:#581C87,stroke-width:2px
-    classDef validation fill:#ECFDF5,stroke:#10B981,color:#065F46,stroke-width:2px
-    classDef optional fill:#F8FAFC,stroke:#94A3B8,color:#475569,stroke-width:1px,stroke-dasharray:4 3
-    classDef result fill:#064E3B,stroke:#34D399,color:#FFFFFF,stroke-width:2px
-
-    style DISCOVERY fill:#F8FAFC,stroke:#CBD5E1,stroke-width:1px
-    style EXPLORATION fill:#FAF5FF,stroke:#DDD6FE,stroke-width:1px
-    style REFINEMENT fill:#F0FDF4,stroke:#BBF7D0,stroke-width:1px
-```
-
-*Solid arrows show the primary pipeline; dashed arrows indicate optional paths and visualization exports.*
-
-Pass 1 creates a broad structural map. If `.architectureX/01_GENERAL_ARCHITECTURE.md` contains a **Feature Catalog**, a lightweight LLM triages up to two relevant features concurrently with map generation. The main agent then receives the map and available architecture/flow documents. It selects which files to boost or downgrade and provides short navigational guidance. Pass 2 reranks the map and appends selected source code.
-
-The system's core distinction is **structural evidence versus task relevance**: tree-sitter and PageRank estimate the dependency structure, while prompt matching and LLM selection specify where to explore that structure.
-
-## Algorithm in detail
-
-### 1. File discovery and prompt conditioning
-
-`repo_map_generator.py` first asks Aider's `GitRepo` for tracked files. It supports immediate nested Git repositories under a common root (with prefixed paths) and falls back to a filtered filesystem walk when Git discovery is unavailable. The fallback excludes common build directories, dependencies, and binary extensions.
-
-The task text is examined for file paths, unique basenames, identifiers, and filename-stem matches. These yield `mentioned_fnames` and `mentioned_idents`. A project dictionary can add feature-to-file matches:
-
-```json
-{
-  "user-authentication": ["src/auth.py", "src/middleware.py"],
-  "payment-processing": ["src/billing.py", "src/stripe_client.py"]
-}
-```
-
-Place it at `.architectureX/project_dictionary.json`. Prompt word n-grams of one to three words are matched to hyphenated keys. Dictionary matches become task seeds and receive a 3× personalization modifier later.
-
-### 2. Git history as an exploration signal
-
-**Recency:** For each file observed in up to 50 recent commits, use the last observed modification time to compute
-
-$$
-r(f) = 2^{-\Delta t_f / 30}
-$$
-
-where `Δt_f` is elapsed time in days. The implemented decay has a **true 30-day half-life**. The top 20 recent files are identified, but only files already mentioned by the task receive recency boosts; this guards against unrelated recent edits.
-
-**Co-change:** Look through up to 200 commits and count files committed together with seeded files. A file becomes eligible if it co-changed at least twice; up to 10 such files are promoted. This can reveal tests, migrations, configuration, and other coupling invisible to source-symbol references.
-
-These heuristics **expand the task-relevant file seeds**. They are not themselves additional dependency edges or directly summed into PageRank scores.
-
-### 3. Build the weighted file-reference graph
-
-Aider extracts `def` (definition) and `ref` (reference) tags with tree-sitter and may fall back to Pygments for references where supported parsers only expose definitions. It creates a NetworkX `MultiDiGraph`: **files are vertices**, and an identifier referenced by file `u` and defined by file `v` creates a directed edge `u → v`.
-
-The direction is important: *referencing/dependent file → defining/provider file*. Parallel edges can represent different identifiers between the same files. A small self-loop with weight 0.1 can preserve a definition with no detected references.
-
-For identifier `s`, Aider computes an edge weight approximately as
-
-$$
-w(u,v;s)=\sqrt{c(u,s)}\cdot
-m_{\mathrm{mentioned}}\cdot
-m_{\mathrm{distinctive}}\cdot
-m_{\mathrm{private}}\cdot
-m_{\mathrm{overloaded}}\cdot
-m_{\mathrm{chat}}
-$$
-
-where `c(u,s)` is the number of occurrences of `s` referenced by `u`, and the multipliers are:
-
-| Condition | Weight |
-| --- | ---: |
-| Identifier explicitly mentioned in task | 10× |
-| Distinctive camelCase/snake_case/kebab-case identifier at least 8 characters long | 10× |
-| Identifier begins with underscore | 0.1× |
-| Identifier defined in more than five files | 0.1× |
-| Referencing file is explicitly in the chat | 50× |
-
-The factors multiply; `sqrt(count)` dampens repetitive names. The **chat 50× factor applies to outgoing graph edges**, not automatically to every agent-selected file.
-
-**Example:** If `handlers/login.py` references `authenticate` defined in `auth/service.py`, the graph includes `handlers/login.py → auth/service.py`. If that service references `issue_token` defined in `auth/tokens.py`, the graph includes `auth/service.py → auth/tokens.py`. The structural ranking can therefore surface important implementation paths even when those file names are not in the task.
-
-**Limit:** This is a symbol-reference graph, not a proven runtime call graph. Dynamic dispatch, name collisions, reflection, generated code, and parser coverage can limit its fidelity.
-
-### 4. Personalized PageRank
-
-NetworkX PageRank scores files from weighted links and a task-biased teleportation distribution. In simplified form, with damping factor `α = 0.85`:
-
-$$
-PR_{t+1}(v) = (1-\alpha)p(v) +
-\alpha\sum_{u\rightarrow v}PR_t(u)\frac{w(u,v)}{\sum_x w(u,x)}
-$$
-
-Here `PR(v)` is the importance of file `v`; `p(v)` is its *normalized personalization weight*; and `w(u,v)` aggregates weights of edges from `u` to `v`. Dangling nodes follow the personalization distribution when supplied.
-
-Aider seeds personalization for files already in chat, explicitly mentioned filenames, and path components matched against mentioned identifiers. The builder changes **the personalization vector before ranking**, not the final PageRank scores:
-
-| Signal | Default multiplier | Effect |
-| --- | ---: | --- |
-| Project dictionary match | 3× | Promotes matched domain files |
-| Agent-selected file | 10× | Seeds a selected file, then raises its personalization |
-| Agent-downgraded file | 0.1× via API; 0.05× generator fallback | Reduces *existing* personalization |
-
-**Why seeding matters:** If a selected file has no entry in Aider's personalization vector, multiplying zero changes nothing. In Pass 2, the builder now explicitly adds agent-selected files to `mentioned_fnames` *before* applying their configurable boost factor. This makes the selected-file boost effective even when the original task did not mention the filename.
-
-Downgrading affects only files with existing personalization; it does **not** remove a vertex, delete edges, multiply its final rank by 0.1, or guarantee exclusion. The actual rank shift depends on graph topology and normalization.
-
-An optional NVIDIA RAPIDS cuGraph implementation is attempted for PageRank when available, with NetworkX as CPU fallback. Floating-point rankings can differ slightly between implementations.
-
-### 5. Translate PageRank into a token-bounded map
-
-After PageRank, Aider distributes each source file's rank across its outgoing edges proportionally to edge weight, crediting **(defining file, identifier)** pairs:
-
-$$
-\mathrm{credit}(v,s)\;{+}{=}\;PR(u)\,\frac{w(u,v;s)}{\sum_x w(u,x)}
-$$
-
-These definition tags are sorted by credit and rendered with source structure and contextual lines. Important definitions appear earlier; lesser-priority details are compressed or omitted. Files with no usable tags can still appear. Aider searches for how many ranked tags fit the available token budget.
-
-**Actual budgets in this implementation:** `RepoMap` is configured with `map_mul_no_files=2`. When there are no chat files, the map target is up to **2×** the model's map-token setting, capped by its input limit minus 4,096 reserved tokens. Both passes currently use the same 2× no-chat setting; there is **no implemented 8× first-pass budget**. The structural map's budget is separate from the additional source-injection allowance.
-
-When map generation is empty, fallback attempts run without chat files and then without task hints.
-
-## Agentic graph exploration and Pass 2
-
-The agent **does not modify the graph's reference edges**. It reads the structural map and advises which files should receive more or less teleportation weight.
-
-1. **Architecture triage (optional):** If a Feature Catalog exists in `.architectureX/01_GENERAL_ARCHITECTURE.md`, a small LLM classifies the task into zero to two feature IDs. The corresponding `.architectureX/flows/*.md` files are supplied to the main agent. This runs alongside Pass 1.
-2. **Exploration:** The main LLM receives the task, architecture, flow docs, and repo map. When one feature remains unclear, it can call `get_feature_details` once to retrieve its flow and optional `.architectureX/flows/flow_files_dictionary.json` file list.
-3. **Selection:** The prompt guides the agent toward roughly **3–12 files to boost**, **0–15 to downgrade**, and short notes about hidden coupling and call/data-flow direction. Broad cross-cutting tasks should have no downgrades; these ranges are guidance rather than hard enforcement.
-4. **Validation:** `FileSelectionResult` (Pydantic v2) parses the LLM JSON, normalizes repository-relative paths, rejects absolute/traversal paths, and deduplicates. The pipeline then removes filenames absent from file discovery and makes boosts take precedence over downgrades.
-5. **Reranking:** Pass 2 reseeds selected files, applies configured personalization factors, and rerenders the map. The result cache keys on the repository fingerprint, prompt, model, selections, and factor values; the Aider map cache is bypassed when customized ranking requires recomputation.
-6. **Context assembly:** Navigational notes are prepended; selected readable files are appended in priority order, capped at **500 lines per file** and about **30,000 extra tokens** (estimated using four characters/token). Symlinks resolving outside the repository are skipped.
-
-If the first LLM response is valid JSON, it is used directly. Otherwise, a structured-output LLM call is attempted, followed by a raw-JSON fallback. An LLM failure returns the broad map. Missing required agentic configuration produces an explicit error (HTTP **503** in service mode).
-
-## Pydantic contracts and API
-
-The shared `schemas.py` module defines:
-
-| Schema | Role |
+| What goes in | What comes out |
 | --- | --- |
-| `MapRequest` | Absolute root, nonblank task, finite bounded ranking factors; rejects unexpected request fields |
-| `FileSelectionResult` | Validates LLM selection payload and safe relative file paths |
-| `RepoMapResult` | Shared result and typed diagnostic steps for deterministic/agentic passes |
-| `MapResponse` | Validated HTTP response with logs |
+| Repository path + natural-language task | Ranked code map + navigational notes + selected source excerpts |
+| Optional architecture and feature-flow documents | Better task-to-file grounding |
+| Git history and symbol references | Context beyond filename keyword matches |
 
-FastAPI responds **422** to invalid payloads, **400** for nonexistent roots, and **503** for missing agentic configuration.
+**Two modes:** deterministic mapping (no LLM required), or agentic mapping (two-pass file selection through OpenRouter).
 
-### POST /map
+## Quick start
 
-```bash
-curl -X POST http://127.0.0.1:8000/map \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "root": "/absolute/path/to/repo",
-    "prompt": "fix authentication middleware",
-    "agentic": true,
-    "boost_factor": 10.0,
-    "downgrade_factor": 0.1
-  }'
-```
-
-`agentic` defaults to `false`. The `boost_factor` must be greater than 0 and at most 100; `downgrade_factor` must be greater than 0 and at most 1. Response fields include `repo_map`, `rel_files`, `mentioned_fnames`, `agent_boost_fnames`, `agent_downgrade_fnames`, `agentic_steps`, `agentic_log`, Git/dictionary boosts, and model/token-budget metadata.
-
-### GET /health
-
-Returns `{"status": "ok"}`.
-
-## Installation
-
-**Prerequisites:** Python 3.11+, Git, and an [OpenRouter](https://openrouter.ai/) key for agentic mode. Node.js/npm is needed for the development viewer.
+**Requirements:** Python 3.11+, Git, and an [OpenRouter](https://openrouter.ai/) key for agentic mode.
 
 ```bash
 git clone https://github.com/MohammadAsadolahi/Agentic-Coding-Context-Builder.git
 cd Agentic-Coding-Context-Builder
+
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Configure `.env` using these variables:
-
-| Variable | Purpose |
-| --- | --- |
-| `OPENROUTER_API_KEY` | Required in agentic mode |
-| `OPENROUTER_MODEL` | Agent selection model; also triage by default |
-| `OPENROUTER_BASE_URL` | Defaults to `https://openrouter.ai/api/v1` |
-| `REPO_MAP_MODEL` | Aider tokenizer/map configuration; not an API call |
-| `TRIAGE_MODEL` | Optional model override for feature triage |
-
-### Run from CLI
+Set `OPENROUTER_API_KEY` in `.env`. The example file also supplies `OPENROUTER_MODEL` and `REPO_MAP_MODEL`.
 
 ```bash
-# Two-pass agentic mode
-python app.py --root /absolute/path/to/repo --prompt "fix authentication"
+# Two-pass, LLM-guided context
+python app.py --root /absolute/path/to/repo --prompt "fix authentication middleware"
 
-# Deterministic single-pass mode
-python repo_map_generator.py --prompt "fix authentication" /absolute/path/to/repo
+# Single-pass, no LLM call
+python repo_map_generator.py --prompt "fix authentication middleware" /absolute/path/to/repo
 ```
 
-### Start API and frontend
+## How it works
+
+```mermaid
+flowchart TB
+    INPUT["Developer task"]
+
+    subgraph S1 [01 - DISCOVER AND RANK]
+        direction LR
+        FILES["Git files and task signals"]
+        TAGS["Tree-sitter symbols"]
+        REFS["Weighted file references"]
+        PAGERANK["Personalized PageRank"]
+        MAP1["Pass 1: broad repository map"]
+        FILES --> TAGS --> REFS --> PAGERANK --> MAP1
+    end
+
+    subgraph S2 [02 - AGENTIC REFINEMENT]
+        direction LR
+        ARCH["Optional architecture and flow docs"]
+        SELECT["LLM selects relevant files"]
+        VALIDATE["Pydantic validates selections"]
+        MAP2["Pass 2: reranked map and source"]
+        ARCH -.-> SELECT
+        SELECT --> VALIDATE --> MAP2
+    end
+
+    RESULT["Task-ready coding context"]
+
+    INPUT --> FILES
+    INPUT -.-> ARCH
+    MAP1 --> SELECT
+    MAP1 -.-> RESULT
+    MAP2 --> RESULT
+
+    classDef dark fill:#0F172A,stroke:#38BDF8,color:#FFFFFF,stroke-width:2px;
+    classDef structure fill:#DBEAFE,stroke:#1D4ED8,color:#0F172A,stroke-width:2px;
+    classDef focus fill:#1E40AF,stroke:#60A5FA,color:#FFFFFF,stroke-width:2px;
+    classDef agent fill:#F3E8FF,stroke:#7E22CE,color:#3B0764,stroke-width:2px;
+    classDef safe fill:#DCFCE7,stroke:#15803D,color:#052E16,stroke-width:2px;
+    classDef output fill:#065F46,stroke:#34D399,color:#FFFFFF,stroke-width:2px;
+
+    class INPUT dark;
+    class FILES,TAGS,REFS structure;
+    class PAGERANK,MAP1,MAP2 focus;
+    class ARCH,SELECT agent;
+    class VALIDATE safe;
+    class RESULT output;
+
+    style S1 fill:#EFF6FF,stroke:#93C5FD,color:#0F172A,stroke-width:1px;
+    style S2 fill:#FAF5FF,stroke:#D8B4FE,color:#3B0764,stroke-width:1px;
+```
+
+*Solid arrows show the agentic path; the dashed line from Pass 1 to the result is the single-pass alternative. Architecture documents are optional.*
+
+1. **Discover.** Find tracked files; match prompt terms, identifiers, and filenames; enrich task relevance using Git recency and co-change history.
+2. **Rank.** Extract symbol definitions and references, build a directed file graph, and use personalized PageRank to prioritize relevant code.
+3. **Refine.** An LLM reviews the broad map and optional architecture documents, selects files to boost or downgrade, and returns navigational notes.
+4. **Deliver.** Pydantic validates selections. A second ranking pass builds the focused map and appends selected source excerpts.
+
+### The ranking idea
+
+A file referencing a symbol defined elsewhere creates a directed edge **referencing file → defining file**. Edge weights reflect symbol usage and relevance. PageRank propagates importance across those references, while a *personalization vector* biases the ranking toward task-related files.
+
+```text
+User task → relevant file seeds → weighted reference graph
+                                 ↓
+                         Personalized PageRank
+                                 ↓
+                       Ranked definitions + map
+```
+
+The second pass **seeds the agent-selected files before boosting** their personalization, so an important file can be promoted even if it wasn't named in the prompt. The agent changes ranking preferences; it does not rewrite source dependencies.
+
+**[Read the full algorithm](docs/ALGORITHM.md)** for edge-weight factors, the PageRank equation, 30-day Git-recency decay, token-budget behavior, graph limitations, and LLM exploration rules.
+
+## API and interfaces
+
+**HTTP service:**
 
 ```bash
 uvicorn service:app --host 127.0.0.1 --port 8000
-# In another terminal:
-cd plotter && npm ci && npm run dev
-# Visit http://localhost:5199
+
+curl -X POST http://127.0.0.1:8000/map \
+  -H 'Content-Type: application/json' \
+  -d '{"root":"/absolute/path/to/repo","prompt":"fix authentication","agentic":true}'
 ```
 
-Or launch both development services from the project root using `./cli.sh run` after installing frontend packages.
+`POST /map` returns the repository map, ranked/selected filenames, model metadata, and optional agentic steps. `GET /health` returns service health. The API defaults to **single-pass mode** (`"agentic": false`).
 
-The React Flow visualization shows exported file nodes and a **simplified** dependency graph. **Its heat color is not raw PageRank:** it combines map-order position (70%) and symbol count (30%). The visualization reconstructs links from the rendered map's selected files, and it only draws links with at least three distinct symbol references. The underlying ranking graph may be larger and structurally different.
+**Visual explorer:** From `plotter/`, run `npm ci && npm run dev` (with the API running) to open the React Flow view at `http://localhost:5199`. It shows file relationships, heat-based ranking indicators, request controls, and run diagnostics. The viewer's heat is an approximation based on map order and symbol density—not raw PageRank.
 
-### Docker and remote deployment
+**Docker:** `docker compose up --build` exposes the API on port 8000. The included compose file mounts host files read-only under `/host`; use container-visible paths when making requests.
 
-```bash
-docker compose up --build
-```
+## Configuration
 
-The compose setup mounts the host filesystem read-only at `/host`. Pass container-visible paths such as `/host/home/user/project` to the API. `docker-compose.offline.yml` supports internal package mirrors; `deploy.sh` supports SSH-based deployment.
+| Variable | Purpose |
+| --- | --- |
+| `OPENROUTER_API_KEY` | Required for agentic mode |
+| `OPENROUTER_MODEL` | LLM for file selection and default feature triage |
+| `REPO_MAP_MODEL` | Model configuration used by Aider for map/token sizing |
+| `OPENROUTER_BASE_URL` | Optional OpenRouter-compatible endpoint |
+| `TRIAGE_MODEL` | Optional separate model for feature triage |
 
-## Testing and diagnostics
+Optional project context: `.architectureX/project_dictionary.json` maps feature names to files. `.architectureX/01_GENERAL_ARCHITECTURE.md` and `.architectureX/flows/` can supply the agent with architecture and feature-flow guidance.
+
+## Development
 
 ```bash
 pip install -r requirements-dev.txt
 python -m pytest -q tests/test_schemas.py
-python -m compileall -q schemas.py service.py agentic_mapper.py repo_map_generator.py
 
-# LLM-backed stress harnesses (require configured model and sample repo)
-python audit_runner.py /path/to/target-repo
-python audit_runner_40.py /path/to/target-repo
+# LLM-backed stress tests on a representative repository
+python audit_runner.py /path/to/repo
+python audit_runner_40.py /path/to/repo
 ```
 
-The Pydantic contract tests require no model credentials. The 20- and 40-prompt audits exercise broad prompt categories but do not compare selected files against a labeled ground-truth dataset.
+Core modules: `repo_map_generator.py` (structural ranking), `agentic_mapper.py` (LLM-guided refinement), `schemas.py` (Pydantic contracts), `service.py` (FastAPI), and `plotter/` (React visualization).
 
-Result caching uses a Git fingerprint (HEAD, tracked working-tree state, dirty-file mtimes), prompt, model, dictionary metadata, selected paths, and ranking factors; tag caches are reused across passes. A fixed `PYTHONHASHSEED=0` improves repeatability, but it does not guarantee identical GPU floating-point results or eliminate external model variability.
+**Security:** The API accepts server-side filesystem paths and can return source contents. Restrict access and mounts; do not expose it on an untrusted network without authentication. Agentic mode sends repository context to the configured model provider.
 
-## Security and operational considerations
+---
 
-- `POST /map` reads server-visible repository files and can return source text. **Do not expose it to untrusted networks** without authentication, filesystem restrictions, and appropriate authorization.
-- Agentic mode transmits task, repo-map, and optional architecture context to the configured LLM provider. Review privacy and provider policies before using confidential repositories.
-- Map generation is serialized within a Python process because personalization and the cached Aider `RepoMap` are shared state.
-- A reference graph is evidence of likely code relationships, not proof of runtime execution. Inspect the actual code and test edits before relying on its suggestions.
-
-## Project layout
-
-| File / directory | Responsibility |
-| --- | --- |
-| `repo_map_generator.py` | Git discovery, prompt conditioning, Aider graph/PageRank, caching, visualization export |
-| `agentic_mapper.py` | Feature triage, file selection, second pass, context/source injection |
-| `schemas.py` | Shared Pydantic v2 validation |
-| `service.py` / `app.py` | FastAPI / agentic CLI |
-| `plotter/` | React, TypeScript, Vite, React Flow |
-| `run_local.py` / `cli.sh` | Combined runner / local dev commands |
-| `tests/` | Contract regression tests |
-| `audit_runner*.py` | LLM prompt stress harnesses |
-| `Dockerfile` / `docker-compose*.yml` / `deploy.sh` | Deployment |
-
-## Foundations and license
-
-Built on [Aider](https://github.com/Aider-AI/aider), [NetworkX](https://networkx.org/), [tree-sitter](https://tree-sitter.github.io/tree-sitter/), [LangChain](https://python.langchain.com/), [Pydantic](https://docs.pydantic.dev/latest/), and [FastAPI](https://fastapi.tiangolo.com/). Aider supplies the base graph/ranking and symbol-rendering engine; this project adds task-aware orchestration, Git-context enrichment, typed validation, and visualization.
-
-Licensed under [MIT](LICENSE).
+Built on [Aider](https://github.com/Aider-AI/aider), [NetworkX](https://networkx.org/), and [Pydantic](https://docs.pydantic.dev/latest/). Licensed under [MIT](LICENSE).
