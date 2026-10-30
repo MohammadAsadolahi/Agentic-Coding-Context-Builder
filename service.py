@@ -9,66 +9,38 @@ Usage:
     uvicorn service:app --host 0.0.0.0 --port 8000
 """
 
-from dataclasses import asdict
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 import glob
 import os
 import time
 import json
 
-from agentic_mapper import run_agentic_map
+from agentic_mapper import AgenticConfigurationError, run_agentic_map
+from schemas import MapRequest, MapResponse
 from repo_map_generator import generate_repo_map
 
 app = FastAPI(title="Agentic Repo Map Service")
-
-
-class MapRequest(BaseModel):
-    root: str = Field(description="Absolute path to the repository root.")
-    prompt: str = Field(description="User prompt describing the task.")
-    agentic: bool = Field(default=False, description="If true, run the agentic pipeline. If false, return only the broad map.")
-    boost_factor: float = Field(default=10.0, description="Boost multiplier for agent-selected files (default 10×).")
-    downgrade_factor: float = Field(default=0.1, description="Downgrade multiplier for agent-suppressed files (default 1/10 = 10× reduction).")
-
-
-class MapResponse(BaseModel):
-    root: str
-    model_name: str
-    edit_format: str
-    map_tokens: int
-    max_input_tokens: int
-    effective_budget: int
-    used_git: bool
-    rel_files: list[str]
-    mentioned_idents: list[str]
-    mentioned_fnames: list[str]
-    repo_map: str
-    chat_rel_fnames: list[str]
-    recency_boost_fnames: list[str]
-    cochange_boost_fnames: list[str]
-    dict_boost_fnames: list[str]
-    agent_boost_fnames: list[str] = []
-    agent_downgrade_fnames: list[str] = []
-    agentic_log: str = ""
-    agentic_steps: list[dict] = []
 
 
 @app.post("/map", response_model=MapResponse)
 def generate_map(req: MapRequest):
     print(
         f"\n>>> Received /map request: root={req.root!r}, prompt={req.prompt!r}", flush=True)
-    root = os.path.abspath(req.root)
+    root = req.root
     if not os.path.isdir(root):
         raise HTTPException(status_code=400, detail=f"Not a directory: {root}")
 
     t0 = time.monotonic()
     agentic_log = ""
     if req.agentic:
-        result = run_agentic_map(
-            root, req.prompt,
-            boost_factor=req.boost_factor,
-            downgrade_factor=req.downgrade_factor,
-        )
+        try:
+            result = run_agentic_map(
+                root, req.prompt,
+                boost_factor=req.boost_factor,
+                downgrade_factor=req.downgrade_factor,
+            )
+        except AgenticConfigurationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         # Read the latest agentic log file
         log_files = sorted(glob.glob(os.path.join(root, "agentic_log_*.txt")))
         if log_files:
@@ -81,7 +53,7 @@ def generate_map(req: MapRequest):
         result = generate_repo_map(root, user_prompt=req.prompt)
     duration_ms = round((time.monotonic() - t0) * 1000)
 
-    resp = asdict(result)
+    resp = result.model_dump()
     resp["agentic_log"] = agentic_log
 
     # Patch plotter graph_data.json with duration + output data for history
@@ -108,7 +80,7 @@ def generate_map(req: MapRequest):
     except Exception:
         pass
 
-    return MapResponse(**resp)
+    return MapResponse.model_validate(resp)
 
 
 @app.get("/health")

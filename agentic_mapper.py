@@ -12,9 +12,7 @@ Dependencies:
     pip install aider-chat langchain langchain-openai python-dotenv
 """
 
-from dataclasses import replace as _dc_replace
 from pathlib import Path
-from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 from openai import OpenAIError
@@ -87,20 +85,15 @@ class AgenticLogger:
 
 _active_logger: AgenticLogger | None = None
 
-from repo_map_generator import (
-    RepoMapResult,
-    generate_repo_map,
-)
+from repo_map_generator import generate_repo_map
+from schemas import FileSelectionResult, RepoMapResult, scope_selection_to_repo
 
 ENV_PATH = Path(__file__).with_name(".env")
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
-class FileSelectionResult(BaseModel):
-    """Structured output: lists of files to boost and downgrade."""
-    selected_files: list[str] = Field(default_factory=list)
-    downgrade_files: list[str] = Field(default_factory=list)
-    context_notes: str = Field(default="")
+class AgenticConfigurationError(RuntimeError):
+    """Missing LLM configuration for agentic mode."""
 
 
 def _load_config() -> dict[str, str]:
@@ -361,13 +354,18 @@ def _read_boosted_file_contents(
     sections: list[str] = []
     tokens_used = 0
 
+    root_path = Path(root).resolve()
     for rel_path in selected_files:
         # Skip binary / non-text files
         ext = os.path.splitext(rel_path)[1].lower()
         if ext in _BINARY_EXTENSIONS:
             continue
 
-        abs_path = os.path.join(root, rel_path)
+        # A tracked symlink can still point outside the repository.
+        resolved = (root_path / rel_path).resolve()
+        if not resolved.is_relative_to(root_path):
+            continue
+        abs_path = str(resolved)
         if not os.path.isfile(abs_path):
             continue
 
@@ -523,7 +521,9 @@ def run_agentic_map(
         print(
             f"ERROR: Missing .env keys: {', '.join(missing)}", file=sys.stderr
         )
-        sys.exit(1)
+        raise AgenticConfigurationError(
+            f"Missing agentic configuration: {', '.join(missing)}"
+        )
 
     # ── Read architecture early (needed for triage, runs in parallel) ────
     general_architecture = _get_general_architecture(root)
@@ -776,7 +776,7 @@ def run_agentic_map(
                     "title": "LLM Call 2 — Output (skipped: fast path)",
                     "content": f"Extracted directly from first response:\n{json.dumps({'selected_files': selection.selected_files, 'downgrade_files': selection.downgrade_files, 'context_notes': selection.context_notes}, indent=2)}",
                 })
-        except (json.JSONDecodeError, KeyError):
+        except (ValueError, KeyError, TypeError):
             pass  # Fall through to structured extraction
 
     # SLOW PATH: Build a trimmed message list for the structured output call.
@@ -889,12 +889,10 @@ def run_agentic_map(
                 _active_logger = None
                 return result
 
+    # Only repository-discovered files can influence ranking/source injection.
+    selection = scope_selection_to_repo(selection, result.rel_files)
     selected = selection.selected_files
     downgraded = selection.downgrade_files
-
-    # Remove any overlap: boost wins over downgrade
-    downgrade_set = set(downgraded) - set(selected)
-    downgraded = [f for f in downgraded if f in downgrade_set]
 
     print(f"  Selected {len(selected)} files to boost", file=sys.stderr)
     for i, f in enumerate(selected, 1):
@@ -961,9 +959,7 @@ def run_agentic_map(
             f"{context_notes}\n"
             "═══ END CONTEXT ═══\n\n"
         )
-        boosted_result = _dc_replace(
-            boosted_result, repo_map=notes_block + boosted_result.repo_map
-        )
+        boosted_result = boosted_result.model_copy(update={"repo_map": notes_block + boosted_result.repo_map})
         flog.section("AGENT CONTEXT NOTES")
         flog.text("Context notes", context_notes)
         print(f"  Context notes: {len(context_notes)} chars prepended to repo map",
@@ -976,10 +972,7 @@ def run_agentic_map(
     # (Copilot) can start editing without issuing read_file tool calls.
     file_content_block = _read_boosted_file_contents(root, selected)
     if file_content_block:
-        boosted_result = _dc_replace(
-            boosted_result,
-            repo_map=boosted_result.repo_map + "\n" + file_content_block,
-        )
+        boosted_result = boosted_result.model_copy(update={"repo_map": boosted_result.repo_map + "\n" + file_content_block})
         # Count how many files were injected (from the header line)
         injected_count = file_content_block.count("── end of ")
         flog.section("FILE CONTENT INJECTION")
@@ -999,6 +992,8 @@ def run_agentic_map(
     print(f"Agentic log saved to: {flog.path}", file=sys.stderr)
 
     # Attach structured steps to the result
-    boosted_result = _dc_replace(boosted_result, agentic_steps=steps)
+    boosted_result = RepoMapResult.model_validate({
+        **boosted_result.model_dump(), "agentic_steps": steps,
+    })
 
     return boosted_result
