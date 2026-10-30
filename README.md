@@ -9,20 +9,65 @@ Agentic Coding Context Builder constructs a focused, inspectable context payload
 ## How it works
 
 ```mermaid
-flowchart TD
-    Task["Developer task"] --> Discover["File discovery + prompt conditioning"]
-    Discover --> Map1["Pass 1: Tree-sitter tags → weighted reference graph → PageRank → map"]
-    Task --> Triage["Optional feature-catalog triage"]
-    Triage --> Arch["Architecture + feature-flow documents"]
-    Map1 --> Agent["File selection agent"]
-    Arch --> Agent
-    Agent --> Validate["Pydantic validation + repository path filtering"]
-    Validate --> Map2["Pass 2: seeded personalized PageRank + rerender"]
-    Map2 --> Context["Navigation notes + selected source files"]
-    Context --> Result["Context for downstream coding agent"]
-    Map1 --> Plotter["Graph-data export / React Flow viewer"]
-    Map2 --> Plotter
+flowchart TB
+    %% 01 — Deterministic discovery and structural ranking
+    TASK(["Developer task<br/>Natural-language coding request"]):::entry
+
+    subgraph DISCOVERY["01 / DISCOVER & RANK"]
+        direction LR
+        FILES["Repository signals<br/>Git · task terms · history"]:::analysis
+        TAGS["Symbol extraction<br/>tree-sitter definitions + references"]:::analysis
+        GRAPH[("Weighted reference graph<br/>directed file-level links")]:::graph
+        RANK["Personalized PageRank<br/>α = 0.85"]:::graph
+        MAP1[["PASS 1<br/>Broad repository map"]]:::pass
+        FILES --> TAGS --> GRAPH --> RANK --> MAP1
+    end
+
+    %% 02 — Optional architecture triage + LLM-guided exploration
+    subgraph EXPLORATION["02 / UNDERSTAND THE TASK"]
+        direction LR
+        TRIAGE["Feature triage<br/>architecture + flow documents"]:::optional
+        AGENT["LLM graph exploration<br/>boost · downgrade · context notes"]:::agent
+        CHECK["Pydantic validation<br/>safe, existing file paths"]:::validation
+        TRIAGE --> AGENT --> CHECK
+    end
+
+    %% 03 — Refocus the structural map and assemble downstream context
+    subgraph REFINEMENT["03 / BUILD FOCUSED CONTEXT"]
+        direction LR
+        MAP2[["PASS 2<br/>Seed + rerank with PageRank"]]:::pass
+        PACK["Context assembly<br/>navigation notes + source excerpts"]:::analysis
+        MAP2 --> PACK
+    end
+
+    OUT(["Task-ready context<br/>For the downstream coding agent"]):::result
+    VIEW["React Flow visualization<br/>graph + diagnostic history"]:::optional
+
+    TASK --> FILES
+    TASK -. optional .-> TRIAGE
+    MAP1 --> AGENT
+    CHECK --> MAP2
+    PACK --> OUT
+    MAP1 -. single-pass mode .-> OUT
+    MAP1 -.-> VIEW
+    MAP2 -.-> VIEW
+
+    %% High-contrast palette suitable for GitHub light and dark themes
+    classDef entry fill:#0F172A,stroke:#38BDF8,color:#F8FAFC,stroke-width:2px
+    classDef analysis fill:#EFF6FF,stroke:#60A5FA,color:#1E3A8A,stroke-width:1.5px
+    classDef graph fill:#DBEAFE,stroke:#2563EB,color:#1E40AF,stroke-width:2px
+    classDef pass fill:#1D4ED8,stroke:#93C5FD,color:#FFFFFF,stroke-width:2px
+    classDef agent fill:#F3E8FF,stroke:#A855F7,color:#581C87,stroke-width:2px
+    classDef validation fill:#ECFDF5,stroke:#10B981,color:#065F46,stroke-width:2px
+    classDef optional fill:#F8FAFC,stroke:#94A3B8,color:#475569,stroke-width:1px,stroke-dasharray:4 3
+    classDef result fill:#064E3B,stroke:#34D399,color:#FFFFFF,stroke-width:2px
+
+    style DISCOVERY fill:#F8FAFC,stroke:#CBD5E1,stroke-width:1px
+    style EXPLORATION fill:#FAF5FF,stroke:#DDD6FE,stroke-width:1px
+    style REFINEMENT fill:#F0FDF4,stroke:#BBF7D0,stroke-width:1px
 ```
+
+*Solid arrows show the primary pipeline; dashed arrows indicate optional paths and visualization exports.*
 
 Pass 1 creates a broad structural map. If `.architectureX/01_GENERAL_ARCHITECTURE.md` contains a **Feature Catalog**, a lightweight LLM triages up to two relevant features concurrently with map generation. The main agent then receives the map and available architecture/flow documents. It selects which files to boost or downgrade and provides short navigational guidance. Pass 2 reranks the map and appends selected source code.
 
