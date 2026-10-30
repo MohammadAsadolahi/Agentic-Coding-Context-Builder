@@ -35,7 +35,9 @@ from aider.repo import GitRepo
 from aider.repomap import RepoMap
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from functools import wraps
+import threading
+from schemas import RepoMapResult
 from pathlib import Path
 import hashlib
 import json
@@ -64,6 +66,18 @@ _result_cache: dict[str, "RepoMapResult"] = {}
 # pipeline's second pass (with boost/downgrade) to skip Model init, git file
 # discovery, and tree-sitter tag parsing — only PageRank + rendering re-run.
 _intermediate_cache: dict[tuple[str, str], dict] = {}
+
+# PageRank personalization and warm RepoMap instances are process-global.
+# Serialize requests to avoid concurrent threadpool calls leaking boost state.
+_generation_lock = threading.RLock()
+
+
+def _serialized_generation(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        with _generation_lock:
+            return fn(*args, **kwargs)
+    return wrapped
 
 # ─── Dictionary-based personalization boost ───────────────────────────────────
 # Maps rel_fname → personalization multiplier for files matched by the
@@ -149,6 +163,8 @@ def _make_cache_key(
     force_budget_multiplier: int | None = None,
     agent_boost_fnames: list[str] | None = None,
     agent_downgrade_fnames: list[str] | None = None,
+    agent_boost_factor: float | None = None,
+    agent_downgrade_factor: float | None = None,
 ) -> str:
     """Deterministic cache key from all inputs that affect the output."""
     key_data = json.dumps(
@@ -162,6 +178,8 @@ def _make_cache_key(
             "budget_mul": force_budget_multiplier,
             "agent_boost": sorted(agent_boost_fnames or []),
             "agent_downgrade": sorted(agent_downgrade_fnames or []),
+            "agent_boost_factor": agent_boost_factor,
+            "agent_downgrade_factor": agent_downgrade_factor,
         },
         sort_keys=True,
     )
@@ -337,28 +355,6 @@ def _gpu_accelerated_pagerank(
 
 # Apply monkey-patch at module load time
 _nx.pagerank = _gpu_accelerated_pagerank
-
-
-@dataclass
-class RepoMapResult:
-    root: str
-    model_name: str
-    edit_format: str
-    map_tokens: int
-    max_input_tokens: int
-    effective_budget: int
-    used_git: bool
-    rel_files: list[str]
-    mentioned_idents: list[str]
-    mentioned_fnames: list[str]
-    repo_map: str
-    chat_rel_fnames: list[str] = field(default_factory=list)
-    recency_boost_fnames: list[str] = field(default_factory=list)
-    cochange_boost_fnames: list[str] = field(default_factory=list)
-    dict_boost_fnames: list[str] = field(default_factory=list)
-    agent_boost_fnames: list[str] = field(default_factory=list)
-    agent_downgrade_fnames: list[str] = field(default_factory=list)
-    agentic_steps: list[dict] = field(default_factory=list)
 
 
 def _load_project_dictionary(root: str) -> dict | None:
@@ -546,7 +542,7 @@ def get_git_recency_boosts(
         score = exp(-elapsed_days / half_life_days)
 
     A file touched today scores ~1.0; one last modified *half_life_days* ago
-    scores exp(-1) ≈ 0.37; one modified 3× *half_life_days* ago scores ~0.05.
+    scores 0.5; one modified 3× *half_life_days* ago scores 0.125.
     This is independent of commit frequency, so a slow repo with one
     commit/month and a fast repo with 20 commits/day are treated consistently.
 
@@ -589,7 +585,7 @@ def get_git_recency_boosts(
             except (IndexError, ValueError):
                 commit_ts = int(now)
             elapsed_days = max(0.0, (now - commit_ts) / 86400.0)
-            current_decay = math.exp(-elapsed_days / max(half_life_days, 1.0))
+            current_decay = math.exp(-math.log(2) * elapsed_days / max(half_life_days, 1.0))
             continue
         if not line:
             continue
@@ -826,6 +822,7 @@ REPO_CONTENT_PREFIXES = {
 }
 
 
+@_serialized_generation
 def generate_repo_map(
     root,
     user_prompt=None,
@@ -850,11 +847,10 @@ def generate_repo_map(
     multiplier (which normally drops to 1 when chat files are provided).
     Use this to keep the full budget in a boosted second-pass.
 
-    *agent_boost_fnames* — relative paths of files selected by the agentic
-    mapper.  These receive a 5× PageRank personalization boost (similar to
-    dictionary boost but stronger) and are added to mentioned_fnames so they
-    rank highly in the output.  Unlike chat_rel_fnames, these files are NOT
-    excluded from the map output.
+    *agent_boost_fnames* — relative paths selected by the agentic mapper.
+    These seed mentioned_fnames to ensure nonzero personalization before
+    the configurable agent multiplier is applied. Unlike chat_rel_fnames,
+    they remain eligible for the map output.
 
     *agent_downgrade_fnames* — relative paths of files the agentic mapper
     wants to suppress.  These receive a 20× PageRank personalization
@@ -870,7 +866,9 @@ def generate_repo_map(
                                      chat_rel_fnames, repo_fp,
                                      force_budget_multiplier,
                                      agent_boost_fnames,
-                                     agent_downgrade_fnames)
+                                     agent_downgrade_fnames,
+                                     agent_boost_factor,
+                                     agent_downgrade_factor)
         cached = _result_cache.get(_cache_key)
         if cached is not None:
             return cached
@@ -997,14 +995,13 @@ def generate_repo_map(
             )
 
     # ── Agent-selected boost ──────────────────────────────────────────────────
-    # Files selected by the agentic mapper receive a 5× personalization boost
-    # via _agent_boost_targets in the monkey-patched PageRank.  They are NOT
-    # added to mentioned_fnames to avoid double-boosting (mentioned status
-    # already gives ~10× base weight).
+    # Unmentioned files have zero PageRank personalization in upstream Aider.
+    # Make agent-selected files explicit seeds before multiplying their weight.
     agent_boosts: set[str] = set(valid_agent_boost)
+    mentioned_fnames.update(agent_boosts)
     if agent_boosts:
         print(
-            f"  Agent boost: {len(agent_boosts)} files (5× personalization)",
+            f"  Agent boost: {len(agent_boosts)} files (seed + multiplier)",
             file=sys.stderr,
         )
 
@@ -1042,6 +1039,11 @@ def generate_repo_map(
     # ── Strategy 2: pre-warm tag cache in parallel ────────────────────────────
     _prewarm_tags_parallel(repo_map, sorted(set(chat_fnames) | all_abs_files))
 
+    # Upstream Aider map-cache keys omit our boost multipliers. Recompute
+    # ranked tags when personalization differs; our result cache remains keyed
+    # by prompt, repository fingerprint, selected files, and both factors.
+    force_refresh = bool(dict_boosts or agent_boosts or agent_downgrades)
+
     # ── Activate dictionary + agent boosts/downgrades in PageRank ────────
     global _dict_boost_targets, _agent_boost_targets, _agent_downgrade_targets
     try:
@@ -1067,6 +1069,7 @@ def generate_repo_map(
             other_fnames,
             mentioned_fnames=mentioned_fnames,
             mentioned_idents=mentioned_idents,
+            force_refresh=force_refresh,
         )
 
         if not result:
@@ -1075,12 +1078,14 @@ def generate_repo_map(
                 all_abs_files,
                 mentioned_fnames=mentioned_fnames,
                 mentioned_idents=mentioned_idents,
+                force_refresh=force_refresh,
             )
 
         if not result:
             result = repo_map.get_repo_map(
                 set(),
                 all_abs_files,
+                force_refresh=force_refresh,
             )
     finally:
         _dict_boost_targets = {}

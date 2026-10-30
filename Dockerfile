@@ -30,7 +30,7 @@ RUN pip install \
     ${PIP_TRUSTED_HOST:+--trusted-host "$PIP_TRUSTED_HOST"} \
     -r requirements.txt
 
-COPY repo_map_generator.py agentic_mapper.py service.py ./
+COPY repo_map_generator.py agentic_mapper.py service.py schemas.py ./
 
 # Allow git to work on host-mounted repos (mounted at /host)
 RUN git config --global --add safe.directory '*'
